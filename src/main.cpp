@@ -26,6 +26,21 @@ NimBLECharacteristic *CyclingPowerMeasurement;
 NimBLECharacteristic *CyclingPowerFeature;
 NimBLECharacteristic *CyclingPowerSensorLocation;
 
+// Add these at the top with other global variables
+const unsigned long UPDATE_INTERVAL_MS = 3000;  // Send to watch every 100ms
+float cumulativeRevolutions = 0.0f;  // Use float for accurate revolution counting
+float lastCadence = 0.0f;
+float currentCadence = 0.0f;
+unsigned long lastBikeUpdate = 0;
+
+// Add these global variables for storing latest bike data
+struct BikeData {
+    short power;
+    float cadence;
+    short resistance;
+    unsigned long lastUpdateTime;
+} latestBikeData = {0, 0.0f, 0, 0};
+
 // Callback classes for BLE server
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer *pServer) override {
@@ -56,37 +71,72 @@ class BikeAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
   }
 };
 
-// Callback for receiving data from the bike
+// Function to send updates to the watch
+void sendWatchUpdate() {
+    if (!isWatchConnected) return;
+    
+    static unsigned long lastWatchUpdate = 0;
+    static float lastSentRevolutions = cumulativeRevolutions;
+    
+    unsigned long now = millis();
+    unsigned long interval = now - lastWatchUpdate;
+    
+    if (interval >= UPDATE_INTERVAL_MS) {
+        // Calculate partial revolutions based on current cadence
+        float revsPerSecond = latestBikeData.cadence / 60.0f;
+        float partialRevs = revsPerSecond * (interval / 1000.0f);
+        
+        // Add small increment to cumulative revolutions
+        cumulativeRevolutions += partialRevs;
+        
+        // Update timestamp by actual interval
+        timestamp = (timestamp + (interval * 1024 / 1000)) & 0xFFFF;
+
+        uint16_t bleRevolutions = (uint16_t)cumulativeRevolutions & 0xFFFF;
+
+        Serial.printf("Sending to watch: Power=%d W, Revolutions=%u (%.2f), Timestamp=%d, Interval=%lu ms, Delta=%.3f\n", 
+                      latestBikeData.power, bleRevolutions, cumulativeRevolutions, timestamp, interval,
+                      cumulativeRevolutions - lastSentRevolutions);
+
+        lastSentRevolutions = cumulativeRevolutions;
+        lastWatchUpdate = now;
+
+        // Prepare BLE buffer
+        int bufferIndex = 0;
+        bleBuffer[bufferIndex++] = flags & 0xFF;
+        bleBuffer[bufferIndex++] = (flags >> 8) & 0xFF;
+        bleBuffer[bufferIndex++] = latestBikeData.power & 0xFF;
+        bleBuffer[bufferIndex++] = (latestBikeData.power >> 8) & 0xFF;
+
+        if (flags & 0x20) {
+            bleBuffer[bufferIndex++] = bleRevolutions & 0xFF;
+            bleBuffer[bufferIndex++] = (bleRevolutions >> 8) & 0xFF;
+            bleBuffer[bufferIndex++] = timestamp & 0xFF;
+            bleBuffer[bufferIndex++] = (timestamp >> 8) & 0xFF;
+        }
+
+        CyclingPowerMeasurement->setValue(bleBuffer, bufferIndex);
+        CyclingPowerMeasurement->notify();
+    }
+}
+
+// Simplified notification callback that just stores the data
 static void notifyCallback(
     BLERemoteCharacteristic *pBLERemoteCharacteristic,
     uint8_t *pData, size_t length, bool isNotify) {
-  powerInstantaneous = pData[11] | pData[12] << 8; // Extract power data
-  powerInstantaneous = powerInstantaneous * powerScale; // Apply scaling
-  cadenceInstantaneous = (pData[4] | pData[5] << 8) / 2; // Convert to RPM
-  resistance = pData[9]; // Extract resistance
-  Serial.printf("Power: %d W, Cadence: %d RPM, Resistance: %d\n",
-                powerInstantaneous, cadenceInstantaneous, resistance);
+    
+    unsigned long now = millis();
+    Serial.printf("Time between bike updates: %lu ms\n", now - lastBikeUpdate);
+    lastBikeUpdate = now;
 
-  // Add this section to send data to the watch
-  if (isWatchConnected) {
-    // Format data according to Cycling Power Measurement characteristic
-    bleBuffer[0] = flags & 0xFF;        // Flags (lower byte)
-    bleBuffer[1] = flags >> 8;          // Flags (upper byte)
-    bleBuffer[2] = powerInstantaneous & 0xFF;  // Power (lower byte)
-    bleBuffer[3] = powerInstantaneous >> 8;    // Power (upper byte)
-    
-    // If using crank revolution data (optional)
-    if (flags & 0x20) {  // Check if crank data flag is set
-      bleBuffer[4] = revolutions & 0xFF;       // Crank revolutions (lower byte)
-      bleBuffer[5] = revolutions >> 8;         // Crank revolutions (upper byte)
-      bleBuffer[6] = timestamp & 0xFF;         // Last crank event time (lower byte)
-      bleBuffer[7] = timestamp >> 8;           // Last crank event time (upper byte)
-    }
-    
-    // Send notification to the watch
-    CyclingPowerMeasurement->setValue(bleBuffer, (flags & 0x20) ? 8 : 4);
-    CyclingPowerMeasurement->notify();
-  }
+    // Store the latest data
+    latestBikeData.power = (pData[11] | (pData[12] << 8)) * powerScale;
+    latestBikeData.cadence = (pData[4] | (pData[5] << 8)) / 2.0f;
+    latestBikeData.resistance = pData[9];
+    latestBikeData.lastUpdateTime = now;
+
+    Serial.printf("Received from bike: Power=%d W, Cadence=%.1f RPM, Resistance=%d\n", 
+                  latestBikeData.power, latestBikeData.cadence, latestBikeData.resistance);
 }
 
 // Attempt to connect to the bike
@@ -101,6 +151,10 @@ bool connectToBike() {
   // Create BLE client
   BLEClient *pClient = BLEDevice::createClient();
   Serial.println(" - Created BLE client");
+
+  // Set connection parameters for faster updates
+  pClient->setConnectionParams(7.5f, 7.5f, 0, 500);  // min interval, max interval, latency, timeout
+  // Requesting 7.5ms intervals (7.5 * 1.25ms = 9.375ms)
 
   // Attempt to connect to the bike
   if (!pClient->connect(foundBike)) {
@@ -181,28 +235,31 @@ void setup() {
 }
 
 void loop() {
-  static unsigned long lastScanTime = 0;
+    static unsigned long lastScanTime = 0;
 
-  // Scan for the bike if not connected
-  if (!isBikeConnected && millis() - lastScanTime > 5000) { // Scan every 5 seconds
-    Serial.println("Scanning for bike...");
-    NimBLEDevice::getScan()->setAdvertisedDeviceCallbacks(new BikeAdvertisedDeviceCallbacks());
-    NimBLEDevice::getScan()->setInterval(1349);
-    NimBLEDevice::getScan()->setWindow(449);
-    NimBLEDevice::getScan()->setActiveScan(true);
-    NimBLEDevice::getScan()->start(5, false); // Scan for 5 seconds
-    lastScanTime = millis();
-  }
+    // Scan for the bike if not connected
+    if (!isBikeConnected && millis() - lastScanTime > 5000) { // Scan every 5 seconds
+        Serial.println("Scanning for bike...");
+        NimBLEDevice::getScan()->setAdvertisedDeviceCallbacks(new BikeAdvertisedDeviceCallbacks());
+        NimBLEDevice::getScan()->setInterval(1349);
+        NimBLEDevice::getScan()->setWindow(449);
+        NimBLEDevice::getScan()->setActiveScan(true);
+        NimBLEDevice::getScan()->start(5, false); // Scan for 5 seconds
+        lastScanTime = millis();
+    }
 
-  // Attempt to connect to the bike if found
-  if (foundBike && !isBikeConnected) {
-    connectToBike();
-  }
+    // Attempt to connect to the bike if found
+    if (foundBike && !isBikeConnected) {
+        connectToBike();
+    }
 
-  // Handle LED feedback
-  if (isBikeConnected) {
-    digitalWrite(LED_PIN, HIGH); // Turn LED on when connected to the bike
-  } else {
-    digitalWrite(LED_PIN, LOW); // Turn LED off otherwise
-  }
+    // Send updates to the watch at the configured interval
+    sendWatchUpdate();
+
+    // Handle LED feedback
+    if (isBikeConnected) {
+        digitalWrite(LED_PIN, HIGH);
+    } else {
+        digitalWrite(LED_PIN, LOW);
+    }
 }
