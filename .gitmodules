@@ -1,0 +1,3 @@
+[submodule "Nimble-Arduino"]
+	path = Nimble-Arduino
+	url = https://github.com/h2zero/NimBLE-Arduino
